@@ -65,7 +65,7 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
             self._get_time_structure_from_dataset(dataset)
 
         # TODO: move all mappings to config file
-        # Field names and mappings netcdf_name: shyft_name
+        # Field names and mappings netcdf_name: shyft_name. See also _transform_raw
         self._shyft_map = {"dew_point_temperature_2m": "dew_point_temperature_2m",
                            "surface_air_pressure": "surface_air_pressure",
                            "relative_humidity_2m": "relative_humidity",
@@ -172,7 +172,6 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
                                                                                 for k in list(extracted_data.keys())}
             return self._convert_to_geo_timeseries(extracted_data, geo_pts, concat=True)
 
-
     def get_forecasts(self, input_source_types, fc_selection_criteria, geo_location_criteria):
         k, v = list(fc_selection_criteria.items())[0]
         if k == 'forecasts_within_period':
@@ -195,10 +194,6 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
         else:
             raise ConcatDataRepositoryError("Unrecognized forecast selection criteria.")
         with Dataset(self._filename) as dataset:
-            # return self._get_data_from_dataset(dataset, input_source_types,
-            #                                    v, geo_location_criteria, concat=False)
-            # return self._get_data_from_dataset(dataset, input_source_types, fc_selection_criteria,
-            #                                    geo_location_criteria, concat=False)
             extracted_data, geo_pts = self._get_data_from_dataset(dataset, input_source_types, fc_selection_criteria,
                                                                   geo_location_criteria, concat=False)
             return self._convert_to_geo_timeseries(extracted_data, geo_pts, concat=False)
@@ -505,9 +500,11 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
         def concat_t(t):
             t_stretch = np.ravel(np.repeat(t, self.fc_len_to_concat).reshape(len(t), self.fc_len_to_concat)
                                  + lead_time[0:self.fc_len_to_concat])
-            # TODO: fixed_dt alternative for Arome if possible
-            last_lead_int = lead_time[-1] - lead_time[-2]
-            return api.TimeAxis(api.UtcTimeVector.from_numpy(t_stretch.astype(int)), int(t_stretch[-1] + last_lead_int))
+            dt_last = lead_time[-1] - lead_time[-2]
+            if np.all(lead_time[1:]-lead_time[:-1] == dt_last): # fixed_dt time axis
+                return api.TimeAxis(int(t_stretch[0]), int(t_stretch[1]) - int(t_stretch[0]), len(t_stretch))
+            else: # point_type time axis
+                return api.TimeAxis(api.UtcTimeVector.from_numpy(t_stretch.astype(int)), int(t_stretch[-1] + dt_last))
 
         def forecast_t(t, daccumulated_var=False):
             nb_ext_lead_times = len(lead_time) - 1 if daccumulated_var else len(lead_time)
@@ -528,15 +525,15 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
                     v_padded = np.zeros((v.shape[0], t.shape[1] + nb_pads, v.shape[2]), dtype=v.dtype)
                     v_padded[:, :-nb_pads, :, :] = v[:, :, :, :]
                     v_padded[:, -nb_pads:, :, :] = v[:, -nb_pads:, :, :]
-
                 else:
                     t_padded = t
                     v_padded = v
                 dt_last = t_padded[0, -1] - t_padded[0, -2]
-                # TODO: fixed_dt alternative if possible
-                return (v_padded,
-                        [api.TimeAxis(api.UtcTimeVector.from_numpy(t_one), int(t_one[-1] + dt_last)) for t_one in
-                         t_padded])
+                if np.all(t_padded[:,1:] - t_padded[:,:-1] == dt_last): # fixed_dt time axis
+                    return (v_padded, [api.TimeAxis(int(tp[0]), int(dt_last), len(tp)) for tp in t_padded])
+                else: # point_type time axis
+                    return (v_padded,
+                            [api.TimeAxis(api.UtcTimeVector.from_numpy(tp), int(tp[-1] + dt_last)) for tp in t_padded])
             else:
                 return (v, t)
 
@@ -549,12 +546,16 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
         def air_temp_conv(T, fcn):
             return fcn(T - 273.15)
 
-        def prec_acc_conv(v, ak, fcn):
-            # TODO: extend with prec_conv if "precipitation_amount" is input, need to set flag for this case
+        def prec_conv(v, ak, fcn):
             p = v
             if ak == "precipitation_amount_acc":
+                # De-accumulate
                 f = api.deltahours(1) / (lead_time[1:] - lead_time[:-1])  # conversion from mm/delta_t to mm/1hour
                 res = fcn(np.clip((p[:, 1:, :, :] - p[:, :-1, :, :]) * f[np.newaxis, :, np.newaxis, np.newaxis], 0.0, 1000.0))
+            elif ak == "precipitation_amount":
+                # TODO: check with Yisak that this is understood correctly
+                f = api.deltahours(1) / lead_time[1:]  # conversion from mm/delta_t to mm/1hour
+                res = fcn(np.clip(p[:, 1:, :, :] * f[np.newaxis, :, np.newaxis, np.newaxis], 0.0, 1000.0))
             return res
 
         def rad_conv(r, fcn):
@@ -562,36 +563,18 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
             return fcn(np.clip(dr / (lead_time[1:] - lead_time[:-1])[np.newaxis, :, np.newaxis, np.newaxis], 0.0, 5000.0))
 
         # Unit- and aggregation-dependent conversions go here
-        # if concat:
-        #     convert_map = {"wind_speed": lambda x, t: (concat_v(x), concat_t(t)),
-        #                    "relative_humidity": lambda x, t: (concat_v(x), concat_t(t)),
-        #                    "temperature": lambda x, t: (air_temp_conv(x, concat_v), concat_t(t)),
-        #                    "radiation": lambda x, t: (rad_conv(x, concat_v), concat_t(t)),
-        #                    # "precipitation_amount": lambda x, t: (prec_conv(x), dacc_time(t)),
-        #                    "precipitation": lambda x, t: (prec_acc_conv(x, concat_v), concat_t(t))}
-        # else:
-        #     convert_map = {"wind_speed": lambda x, t: (forecast_v(x), forecast_t(t)),
-        #                    "relative_humidity": lambda x, t: (forecast_v(x), forecast_t(t)),
-        #                    "temperature": lambda x, t: (air_temp_conv(x, forecast_v), forecast_t(t)),
-        #                    "radiation": lambda x, t: (rad_conv(x, forecast_v), forecast_t(t, True)),
-        #                    # "precipitation_amount": lambda x, t: (prec_conv(x), dacc_time(t)),
-        #                    "precipitation": lambda x, t: (prec_acc_conv(x, forecast_v), forecast_t(t, True))}
-
-        # Unit- and aggregation-dependent conversions go here
         if concat:
             convert_map = {"wind_speed": lambda v, ak, t: (concat_v(v), concat_t(t)),
                            "relative_humidity": lambda v, ak, t: (concat_v(v), concat_t(t)),
                            "temperature": lambda v, ak, t: (air_temp_conv(v, concat_v), concat_t(t)),
                            "radiation": lambda v, ak, t: (rad_conv(v, concat_v), concat_t(t)),
-                           # "precipitation_amount": lambda x, t: (prec_conv(x), dacc_time(t)),
-                           "precipitation": lambda v, ak, t: (prec_acc_conv(v, ak, concat_v), concat_t(t))}
+                           "precipitation": lambda v, ak, t: (prec_conv(v, ak, concat_v), concat_t(t))}
         else:
             convert_map = {"wind_speed": lambda v, ak, t: (forecast_v(v), forecast_t(t)),
                            "relative_humidity": lambda v, ak, t: (forecast_v(v), forecast_t(t)),
                            "temperature": lambda v, ak, t: (air_temp_conv(v, forecast_v), forecast_t(t)),
                            "radiation": lambda v, ak, t: (rad_conv(v, forecast_v), forecast_t(t, True)),
-                           # "precipitation_amount": lambda x, t: (prec_conv(x), dacc_time(t)),
-                           "precipitation": lambda v, ak, t: (prec_acc_conv(v, ak, forecast_v), forecast_t(t, True))}
+                           "precipitation": lambda v, ak, t: (prec_conv(v, ak, forecast_v), forecast_t(t, True))}
         res = {}
         for k, (v, ak) in data.items():
             res[k] = pad(*convert_map[k](v, ak, time))
