@@ -116,9 +116,12 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
         time = convert_netcdf_time(time.units, time)
         self.time = time
         self.lead_time = lead_time[:]
-        if nb_fc_to_drop > len(self.lead_time) - 1:
-            raise ConcatDataRepositoryError("nb_fc_to_drop is too large for dataset")
         self.lead_times_in_sec = lead_time[:] * 3600.
+        if self.nb_lead_intervals is None:
+            self.nb_lead_intervals = len(self.lead_times_in_sec) - nb_fc_to_drop
+        nb_lead_intervals = self.nb_lead_intervals
+        if nb_fc_to_drop + nb_lead_intervals > len(self.lead_times_in_sec):
+            raise  ConcatDataRepositoryError("'nb_fc_to_drop' + 'nb_lead_intervals' i too large")
         # self.fc_interval = time[fc_periodicity] - time[0]
         time_shift_with_drop = time + self.lead_times_in_sec[nb_fc_to_drop]
         # TODO: Errorhandling for idx_max required?
@@ -145,9 +148,10 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
         if self.fc_len_to_concat < 0 \
             or no_shift_fields and self.nb_fc_to_drop + self.fc_len_to_concat > len(self.lead_time) \
             or not no_shift_fields and self.nb_fc_to_drop + self.fc_len_to_concat + 1 > len(self.lead_time):
-                raise ConcatDataRepositoryError("nb_fc_to_drop is too large for concatination")
+                err_msg = "'nb_fc_to_drop={}' is too large for concatination".format(self.nb_fc_to_drop)
+                raise ConcatDataRepositoryError(err_msg)
         with Dataset(self._filename) as dataset:
-            fc_selection_criteria ={'forecasts_that_intersect_period': utc_period}
+            fc_selection_criteria ={'forecasts_with_start_within_period': utc_period}
             extracted_data, geo_pts = self._get_data_from_dataset(dataset, input_source_types, fc_selection_criteria,
                                                                   geo_location_criteria,
                                                                   nb_lead_intervals=self.fc_len_to_concat, concat=True)
@@ -159,7 +163,7 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
                 drop = self.nb_fc_to_drop + self.fc_len_to_concat
                 idx = np.argmax(self.lead_times_in_sec[drop:] - self.lead_times_in_sec[drop] >= sec_to_extend)
                 if idx == 0:
-                    raise ConcatDataRepositoryError( "The latest time in repository is earlier than the end of the "
+                    raise ConcatDataRepositoryError("The latest time in repository is earlier than the end of the "
                                                     "period for which data is requested")
                 extra_data, _ = self._get_data_from_dataset(dataset, input_source_types,
                                     {'latest_available_forecasts': {'number of forecasts': 1,
@@ -172,16 +176,20 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
                                                                                 for k in list(extracted_data.keys())}
             return self._convert_to_geo_timeseries(extracted_data, geo_pts, concat=True)
 
-    def get_forecasts(self, input_source_types, fc_selection_criteria, geo_location_criteria):
+    def get_forecast_ensembles(self, input_source_types, fc_selection_criteria, geo_location_criteria):
         k, v = list(fc_selection_criteria.items())[0]
-        if k == 'forecasts_within_period':
+        if k == 'forecasts_created_within_period':
             if not isinstance(v, api.UtcPeriod):
                 raise ConcatDataRepositoryError(
-                    "'forecasts_within_period' selection criteria should be of type api.UtcPeriod.")
-        elif k == 'forecasts_that_intersect_period':
+                    "'forecasts_created_within_period' selection criteria should be of type api.UtcPeriod.")
+        elif k == 'forecasts_with_start_within_period':
             if not isinstance(v, api.UtcPeriod):
                 raise ConcatDataRepositoryError(
-                    "'forecasts_within_period' selection criteria should be of type api.UtcPeriod.")
+                    "'forecasts_with_start_within_period' selection criteria should be of type api.UtcPeriod.")
+        elif k == 'forecasts_that_cover_period':
+            if not isinstance(v, api.UtcPeriod):
+                raise ConcatDataRepositoryError(
+                    "'forecasts_that_cover_period' selection criteria should be of type api.UtcPeriod.")
         elif k == 'latest_available_forecasts':
             if not all([isinstance(v, dict), isinstance(v['number of forecasts'], int),
                         isinstance(v['forecasts_older_than'], int)]):
@@ -193,22 +201,47 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
                     "'forecasts_at_reference_times' selection criteria should be of type list.")
         else:
             raise ConcatDataRepositoryError("Unrecognized forecast selection criteria.")
+
+        if k == 'forecasts_at_reference_times':
+            return [self.get_forecast_ensembles(input_source_types, {'latest_available_forecasts':
+                                                            {'number of forecasts': 1, 'forecasts_older_than': t_c}},
+                                       geo_location_criteria)[0] for t_c in v]
+        else:
+            with Dataset(self._filename) as dataset:
+                data, geo_pts = self._get_data_from_dataset(dataset, input_source_types, fc_selection_criteria,
+                                                                      geo_location_criteria, concat=False)
+                return self._convert_to_geo_timeseries(data, geo_pts, concat=False)
+
+    def get_forecasts(self, input_source_types, fc_selection_criteria, geo_location_criteria):
+        # Returns first ensemble member of each forecast
+        return [fcst[0] for fcst in
+                self.get_forecast_ensembles(input_source_types, fc_selection_criteria, geo_location_criteria)]
+
+    def get_forecast_ensemble(self, input_source_types, utc_period,
+                              t_c, geo_location_criteria=None):
         with Dataset(self._filename) as dataset:
-            extracted_data, geo_pts = self._get_data_from_dataset(dataset, input_source_types, fc_selection_criteria,
-                                                                  geo_location_criteria, concat=False)
-            return self._convert_to_geo_timeseries(extracted_data, geo_pts, concat=False)
+            fc_selection_criteria = {'forecasts_that_cover_period': utc_period}
+            time_slice, lead_time_slice, m_t = self._make_time_slice(self.nb_fc_to_drop, self.nb_lead_intervals,
+                                                                     fc_selection_criteria)
+            # time = self.time[time_slice]
+            time = self.time[time_slice][m_t[time_slice]]
+            ref_time = time[np.argmin(time <= t_c) - 1]
+            if ref_time.size == 0:
+                raise ConcatDataRepositoryError(
+                    "Not able to find forecast that cover the requested period with the provided restrictions "
+                    "'nb_fc_to_drop'={}, 'nb_lead_intervals'={}, 'fc_periodicity'={} and 't_c'={}". \
+                        format(self.nb_fc_to_drop, self.nb_lead_intervals, self.fc_periodicity, t_c))
+            fc_selection_criteria = {'forecasts_at_reference_times': [int(ref_time)]}
+            return self.get_forecast_ensembles(input_source_types, fc_selection_criteria, geo_location_criteria)[0]
 
     def get_forecast(self, input_source_types, utc_period, t_c, geo_location_criteria):
+        # Returns first ensemble member of forecast
         """
         Parameters:
         see get_timeseries
         semantics for utc_period: Get the forecast closest up to utc_period.start
         """
-        raise NotImplementedError("get_forecast")
-
-    def get_forecast_ensemble(self, input_source_types, utc_period,
-                              t_c, geo_location_criteria=None):
-        raise NotImplementedError("get_forecast_ensemble")
+        return self.get_forecast_ensemble(input_source_types, utc_period, t_c, geo_location_criteria)[0]
 
     def _validate_selection_criteria(self):
         s_c = self.selection_criteria
@@ -244,10 +277,14 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
                 nb_lead_intervals = len(lead_times_in_sec) - nb_fc_to_drop
             else:
                 nb_lead_intervals = self.nb_lead_intervals
+        if nb_fc_to_drop + nb_lead_intervals > len(lead_times_in_sec):
+            raise  ConcatDataRepositoryError("'nb_fc_to_drop' + 'nb_lead_intervals' i too large")
         issubset = True if len(lead_times_in_sec) > nb_fc_to_drop + nb_lead_intervals + 1 else False
         time_slice, lead_time_slice, m_t = self._make_time_slice(nb_fc_to_drop, nb_lead_intervals, fc_selection_criteria)
         # time = self.time[time_slice]
         time = self.time[time_slice][m_t[time_slice]]
+        if np.size(time)==0:
+            raise ConcatDataRepositoryError('No forecast found that meet condiotions')
 
         # Get data by slicing into dataset
         raw_data = {}
@@ -453,19 +490,30 @@ class ConcatDataRepository(interfaces.GeoTsRepository):
 
         k, v = list(fc_selection_criteria.items())[0]
         nb_extra_intervals = 0
-        if k == 'forecasts_within_period':
+        if k == 'forecasts_created_within_period':
             time_slice = ((time >= v.start) & (time <= v.end))
             if not any(time_slice):
                 raise ConcatDataRepositoryError(
-                    "No forecasts found with start time within period {}.".format(v.to_string()))
-        elif k == 'forecasts_that_intersect_period':
+                    "No forecasts found with creation time within period {}.".format(v.to_string()))
+        elif k == 'forecasts_with_start_within_period':
             # shift utc period with nb_fc_to drop
             v_shift = api.UtcPeriod(int(v.start - lead_times_in_sec[nb_fc_to_drop]),
                                     int(v.end - lead_times_in_sec[nb_fc_to_drop]))
             time_slice = ((time >= v_shift.start) & (time <= v_shift.end))
             if not any(time_slice):
                 raise ConcatDataRepositoryError(
-                    "No forecasts found with start time within period {}.".format(v_shift.to_string()))
+                    "No forecasts found that start within period for period {} and "
+                    "'fc_nb_to_drop'={}.".format(v_shift.to_string(),nb_fc_to_drop))
+        elif k == 'forecasts_that_cover_period':
+            # shift utc period with nb_fc_to drop
+            v_shift_first = int(v.start - lead_times_in_sec[nb_fc_to_drop])
+            # shift utc period with nb_fc_to drop + nb_lead_intervals
+            v_shift_last = int(v.end - lead_times_in_sec[nb_fc_to_drop + nb_lead_intervals - 1])
+            time_slice = ((time <= v_shift_first) & (time >= v_shift_last))
+            if not any(time_slice):
+                raise ConcatDataRepositoryError(
+                    "No forecasts found that cover period {} with restrictions 'fc_nb_to_drop'={} "
+                    "and 'nb_lead_intervals'={}.".format(v_shift.to_string(), nb_fc_to_drop, nb_lead_intervals))
         elif k == 'latest_available_forecasts':
             t = v['forecasts_older_than']
             n = v['number of forecasts']
